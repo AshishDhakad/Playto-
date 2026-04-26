@@ -34,30 +34,20 @@ class UserSerializer(serializers.ModelSerializer):
 # ── FILE VALIDATION ───────────────────────────────────────────────────────────
 
 def validate_upload_file(file):
-    """
-    Server-side file validation.
-    We do NOT trust the Content-Type header from the client.
-    """
-    # 1. Size check first — fast, before any disk IO
     if file.size > settings.MAX_UPLOAD_SIZE_BYTES:
         raise serializers.ValidationError(
             f"File too large: {file.size / (1024*1024):.1f} MB. Maximum allowed: 5 MB."
         )
-
-    # 2. Extension check — from filename, not from client header
     _, ext = os.path.splitext(file.name.lower())
     if ext not in settings.ALLOWED_UPLOAD_EXTENSIONS:
         raise serializers.ValidationError(
-            f"Invalid file type '{ext}'. Accepted types: PDF, JPG, PNG."
+            f"Invalid file type '{ext}'. Accepted: PDF, JPG, PNG."
         )
-
-    # 3. MIME check using Python stdlib — independent of client-supplied Content-Type
     guessed_mime, _ = mimetypes.guess_type(file.name)
     if guessed_mime not in ['application/pdf', 'image/jpeg', 'image/png']:
         raise serializers.ValidationError(
             f"File MIME type not allowed: {guessed_mime}."
         )
-
     return file
 
 
@@ -72,12 +62,21 @@ class DocumentSerializer(serializers.ModelSerializer):
                   'file_size', 'mime_type', 'uploaded_at']
 
     def get_file_url(self, obj):
-        """
-        Always returns the full URL whether file is on Cloudinary or local disk.
-        Cloudinary URLs look like: https://res.cloudinary.com/your_cloud/...
-        Local URLs look like: http://localhost:8000/media/...
-        """
-        return obj.get_file_url()
+        try:
+            url = obj.file.url
+        except Exception:
+            return None
+
+        # Already an absolute URL (Cloudinary) — return as-is, never wrap again
+        if url.startswith('http://') or url.startswith('https://'):
+            return url
+
+        # Relative path (local dev) — build absolute URL using request
+        request = self.context.get('request')
+        if request:
+            return request.build_absolute_uri(url)
+
+        return url
 
 
 class DocumentUploadSerializer(serializers.Serializer):
@@ -91,9 +90,9 @@ class DocumentUploadSerializer(serializers.Serializer):
 # ── KYC SUBMISSION ────────────────────────────────────────────────────────────
 
 class KYCSubmissionSerializer(serializers.ModelSerializer):
-    documents          = DocumentSerializer(many=True, read_only=True)
-    merchant_username  = serializers.CharField(source='merchant.username', read_only=True)
-    is_sla_at_risk     = serializers.SerializerMethodField()
+    documents           = serializers.SerializerMethodField()
+    merchant_username   = serializers.CharField(source='merchant.username', read_only=True)
+    is_sla_at_risk      = serializers.SerializerMethodField()
     time_in_queue_hours = serializers.SerializerMethodField()
 
     class Meta:
@@ -109,6 +108,14 @@ class KYCSubmissionSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['status', 'created_at', 'submitted_at', 'review_started_at',
                             'decided_at', 'updated_at', 'merchant_username']
+
+    def get_documents(self, obj):
+        request = self.context.get('request')
+        return DocumentSerializer(
+            obj.documents.all(),
+            many=True,
+            context={'request': request}
+        ).data
 
     def get_is_sla_at_risk(self, obj):
         return obj.is_sla_at_risk

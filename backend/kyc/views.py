@@ -4,7 +4,6 @@ from datetime import timedelta
 
 from django.conf import settings
 from django.utils import timezone
-from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
@@ -18,6 +17,11 @@ from .serializers import (
     ReviewerDashboardSerializer, NotificationLogSerializer,
 )
 from .permissions import IsMerchant, IsReviewer
+
+
+def submission_response(sub, request):
+    """Helper — always passes request so DocumentSerializer builds absolute URLs."""
+    return KYCSubmissionSerializer(sub, context={'request': request}).data
 
 
 # ── AUTH ──────────────────────────────────────────────────────────────────────
@@ -54,7 +58,7 @@ def me(request):
     return Response(UserSerializer(request.user).data)
 
 
-# ── MERCHANT: MY SUBMISSION ───────────────────────────────────────────────────
+# ── MERCHANT ──────────────────────────────────────────────────────────────────
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated, IsMerchant])
@@ -63,7 +67,7 @@ def my_submission(request):
         sub = KYCSubmission.objects.prefetch_related('documents').get(merchant=request.user)
     except KYCSubmission.DoesNotExist:
         return Response({'error': 'No submission found.'}, status=404)
-    return Response(KYCSubmissionSerializer(sub).data)
+    return Response(submission_response(sub, request))
 
 
 @api_view(['PATCH'])
@@ -81,7 +85,8 @@ def update_submission(request):
     if not serializer.is_valid():
         return Response({'errors': serializer.errors}, status=400)
     serializer.save()
-    return Response(KYCSubmissionSerializer(sub).data)
+    sub.refresh_from_db()
+    return Response(submission_response(sub, request))
 
 
 @api_view(['POST'])
@@ -99,7 +104,7 @@ def submit_kyc(request):
 
     required_docs = {'pan', 'aadhaar', 'bank_statement'}
     uploaded_docs = set(sub.documents.values_list('doc_type', flat=True))
-    missing_docs = required_docs - uploaded_docs
+    missing_docs  = required_docs - uploaded_docs
     if missing_docs:
         return Response({'error': f"Missing required documents: {', '.join(missing_docs)}"}, status=400)
 
@@ -109,7 +114,7 @@ def submit_kyc(request):
         return Response({'error': str(e)}, status=400)
 
     NotificationLog.log(request.user, 'kyc_submitted', {'submission_id': sub.id})
-    return Response(KYCSubmissionSerializer(sub).data)
+    return Response(submission_response(sub, request))
 
 
 # ── DOCUMENT UPLOAD ───────────────────────────────────────────────────────────
@@ -133,12 +138,11 @@ def upload_document(request):
     doc_type      = serializer.validated_data['doc_type']
     mime_type, _  = mimetypes.guess_type(uploaded_file.name)
 
-    # Delete old document of same type if exists
-    # Also removes from Cloudinary if cloudinary_storage is active
+    # Delete old document of same type if it exists
     old = Document.objects.filter(submission=sub, doc_type=doc_type).first()
     if old:
         try:
-            old.file.delete(save=False)  # deletes from Cloudinary too
+            old.file.delete(save=False)
         except Exception:
             pass
         old.delete()
@@ -151,10 +155,10 @@ def upload_document(request):
         file_size=uploaded_file.size,
         mime_type=mime_type or 'application/octet-stream',
     )
-    return Response(DocumentSerializer(doc).data, status=201)
+    return Response(DocumentSerializer(doc, context={'request': request}).data, status=201)
 
 
-# ── REVIEWER: QUEUE ───────────────────────────────────────────────────────────
+# ── REVIEWER ──────────────────────────────────────────────────────────────────
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated, IsReviewer])
@@ -167,12 +171,9 @@ def reviewer_queue(request):
     else:
         qs = qs.filter(status__in=[SM.SUBMITTED, SM.UNDER_REVIEW, SM.MORE_INFO_REQUESTED])
 
-    submissions = list(qs)
-    now = timezone.now()
+    submissions    = list(qs)
+    now            = timezone.now()
     seven_days_ago = now - timedelta(days=7)
-
-    total_in_queue = len(submissions)
-    at_risk_count  = sum(1 for s in submissions if s.is_sla_at_risk)
 
     waiting_times = [
         (now - s.submitted_at).total_seconds() / 3600
@@ -181,21 +182,19 @@ def reviewer_queue(request):
     avg_wait_hours = round(sum(waiting_times) / len(waiting_times), 1) if waiting_times else 0
 
     recent_decided = KYCSubmission.objects.filter(
-        decided_at__gte=seven_days_ago,
-        status__in=[SM.APPROVED, SM.REJECTED]
+        decided_at__gte=seven_days_ago, status__in=[SM.APPROVED, SM.REJECTED]
     )
     total_decided  = recent_decided.count()
     approved_count = recent_decided.filter(status=SM.APPROVED).count()
-    approval_rate  = round(approved_count / total_decided * 100, 1) if total_decided else None
 
     return Response({
         'metrics': {
-            'total_in_queue': total_in_queue,
-            'at_risk_count': at_risk_count,
-            'avg_wait_hours': avg_wait_hours,
-            'approval_rate_7d': approval_rate,
+            'total_in_queue':   len(submissions),
+            'at_risk_count':    sum(1 for s in submissions if s.is_sla_at_risk),
+            'avg_wait_hours':   avg_wait_hours,
+            'approval_rate_7d': round(approved_count / total_decided * 100, 1) if total_decided else None,
             'approved_last_7d': approved_count,
-            'decided_last_7d': total_decided,
+            'decided_last_7d':  total_decided,
         },
         'submissions': ReviewerDashboardSerializer(submissions, many=True).data,
     })
@@ -208,7 +207,8 @@ def reviewer_submission_detail(request, pk):
         sub = KYCSubmission.objects.prefetch_related('documents').select_related('merchant').get(pk=pk)
     except KYCSubmission.DoesNotExist:
         return Response({'error': 'Submission not found.'}, status=404)
-    return Response(KYCSubmissionSerializer(sub).data)
+    # Pass request so document URLs are absolute
+    return Response(submission_response(sub, request))
 
 
 @api_view(['POST'])
@@ -241,7 +241,8 @@ def reviewer_transition(request, pk):
         event_map.get(new_status, f'kyc_{new_status}'),
         {'submission_id': sub.id, 'reviewer': request.user.username, 'note': note}
     )
-    return Response(KYCSubmissionSerializer(sub).data)
+    sub.refresh_from_db()
+    return Response(submission_response(sub, request))
 
 
 @api_view(['GET'])
@@ -251,7 +252,7 @@ def all_submissions(request):
     qs = KYCSubmission.objects.select_related('merchant').prefetch_related('documents').order_by('-created_at')
     if status_filter:
         qs = qs.filter(status=status_filter)
-    return Response(KYCSubmissionSerializer(qs, many=True).data)
+    return Response(KYCSubmissionSerializer(qs, many=True, context={'request': request}).data)
 
 
 @api_view(['GET'])
